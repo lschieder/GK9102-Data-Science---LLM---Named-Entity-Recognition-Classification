@@ -1,0 +1,5 @@
+torch           # CPU oder GPU-Version, automatisch gewählt
+datasets
+transformers
+seqeval
+numpy
