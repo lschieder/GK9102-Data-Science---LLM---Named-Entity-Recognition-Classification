@@ -1,5 +1,7 @@
+evaluate
 torch           # CPU oder GPU-Version, automatisch gewählt
 datasets
 transformers
+accelerate>=0.26.0
 seqeval
 numpy

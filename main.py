@@ -1,15 +1,103 @@
 # ---------------------------------------------------- Imports und Installation
 # (Installiere die Libraries vorher im Terminal, z.B. mit pip install datasets transformers torch evaluate seqeval)
 
-from datasets import load_dataset
+import datasets
 from transformers import AutoTokenizer, AutoModelForTokenClassification, TrainingArguments, Trainer, DataCollatorForTokenClassification, pipeline
 import numpy as np
 import evaluate
-
 # ---------------------------------------------------- Schritt 1: CoNLLpp-Datensatz und Tokenizer laden
 print('\n---- Schritt 1: Dataset und Tokenizer Laden ----')
-# Lade den CoNLLpp-Datensatz
-dataset = load_dataset("conllpp")
+# Lade den CoNLLpp-Datensatz ohne Dataset-Script (trust_remote_code wird nicht mehr unterstützt)
+
+# CoNLLpp-Quellen (wie im ursprünglichen Script)
+_URL = "https://github.com/ZihanWangKi/CrossWeigh/raw/master/data/"
+_TRAINING_FILE = "conllpp_train.txt"
+_DEV_FILE = "conllpp_dev.txt"
+_TEST_FILE = "conllpp_test.txt"
+
+# Definiere die möglichen Tag-Namen (wie im ursprünglichen Script), damit wir ClassLabel verwenden können
+POS_TAGS = [
+    '"', "''", "#", "$", "(", ")", ",", ".", ":", "``", "CC", "CD", "DT", "EX", "FW", "IN", "JJ", "JJR", "JJS", "LS", "MD", "NN", "NNP", "NNPS", "NNS", "NN|SYM", "PDT", "POS", "PRP", "PRP$", "RB", "RBR", "RBS", "RP", "SYM", "TO", "UH", "VB", "VBD", "VBG", "VBN", "VBP", "VBZ", "WDT", "WP", "WP$", "WRB"
+]
+CHUNK_TAGS = [
+    "O", "B-ADJP", "I-ADJP", "B-ADVP", "I-ADVP", "B-CONJP", "I-CONJP", "B-INTJ", "I-INTJ", "B-LST", "I-LST", "B-NP", "I-NP", "B-PP", "I-PP", "B-PRT", "I-PRT", "B-SBAR", "I-SBAR", "B-UCP", "I-UCP", "B-VP", "I-VP"
+]
+NER_TAGS = [
+    "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC"
+]
+
+def _download_text(url: str) -> str:
+    import urllib.request
+    with urllib.request.urlopen(url) as resp:
+        return resp.read().decode("utf-8")
+
+
+def _parse_conll_sentences(text: str):
+    """Parst CoNLL-ähnliche Dateien in satzweise Beispiele."""
+    guid = 0
+    tokens, pos_tags, chunk_tags, ner_tags = [], [], [], []
+    for line in text.splitlines():
+        if line.startswith("-DOCSTART-") or line.strip() == "":
+            if tokens:
+                yield {
+                    "id": str(guid),
+                    "tokens": tokens,
+                    "pos_tags": pos_tags,
+                    "chunk_tags": chunk_tags,
+                    "ner_tags": ner_tags,
+                }
+                guid += 1
+                tokens, pos_tags, chunk_tags, ner_tags = [], [], [], []
+        else:
+            # conll2003 tokens are space separated
+            splits = line.split(" ")
+            if len(splits) < 4:
+                # defensiv: Zeile überspringen wenn unvollständig
+                continue
+            tokens.append(splits[0])
+            pos_tags.append(splits[1])
+            chunk_tags.append(splits[2])
+            ner_tags.append(splits[3].strip())
+    if tokens:
+        yield {
+            "id": str(guid),
+            "tokens": tokens,
+            "pos_tags": pos_tags,
+            "chunk_tags": chunk_tags,
+            "ner_tags": ner_tags,
+        }
+
+
+def load_conllpp_as_datasets() -> datasets.DatasetDict:
+    """Lädt CoNLLpp aus den Original-Quellen und baut ein DatasetDict ohne Dataset-Skript."""
+    # Lade Texte
+    train_text = _download_text(f"{_URL}{_TRAINING_FILE}")
+    dev_text = _download_text(f"{_URL}{_DEV_FILE}")
+    test_text = _download_text(f"{_URL}{_TEST_FILE}")
+
+    # Definiere Features mit ClassLabel, sodass wir später label_list korrekt auslesen können
+    features = datasets.Features({
+        "id": datasets.Value("string"),
+        "tokens": datasets.Sequence(datasets.Value("string")),
+        "pos_tags": datasets.Sequence(datasets.ClassLabel(names=POS_TAGS)),
+        "chunk_tags": datasets.Sequence(datasets.ClassLabel(names=CHUNK_TAGS)),
+        "ner_tags": datasets.Sequence(datasets.ClassLabel(names=NER_TAGS)),
+    })
+
+    # Erzeuge Datasets aus Generatoren
+    train_ds = datasets.Dataset.from_generator(lambda: _parse_conll_sentences(train_text), features=features)
+    val_ds = datasets.Dataset.from_generator(lambda: _parse_conll_sentences(dev_text), features=features)
+    test_ds = datasets.Dataset.from_generator(lambda: _parse_conll_sentences(test_text), features=features)
+
+    ds_dict = datasets.DatasetDict({
+        "train": train_ds,
+        "validation": val_ds,
+        "test": test_ds,
+    })
+    return ds_dict
+
+# tatsächliches Laden
+dataset = load_conllpp_as_datasets()
 print(f'> Dataset geladen, mit Splits: {list(dataset.keys())}')
 print(f'> Beispiel für einen Datensatz-Eintrag: {dataset["train"][0]}')
 
@@ -83,7 +171,17 @@ metric = evaluate.load("seqeval")
 print('> seqeval-Metrik für NER geladen.')
 
 def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
+    # Unterstütze ältere und neuere Transformers-Versionen
+    try:
+        # Newer: EvalPrediction with attributes
+        predictions = eval_pred.predictions
+        labels = getattr(eval_pred, 'label_ids', getattr(eval_pred, 'labels', None))
+        if labels is None:
+            # Fallback to tuple-like unpacking
+            predictions, labels = eval_pred
+    except AttributeError:
+        # Older: tuple of (predictions, labels)
+        predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=2)
     # Entferne -100 Labels, damit nur Haupttokens bewertet werden
     true_predictions = [
@@ -97,28 +195,31 @@ def compute_metrics(eval_pred):
     results = metric.compute(predictions=true_predictions, references=true_labels)
     print(f'> Evaluations-Ergebnis: {results}')
     return {
-        "precision": results["overall_precision"],
-        "recall": results["overall_recall"],
-        "f1": results["overall_f1"],
-        "accuracy": results["overall_accuracy"],
+        "precision": results.get("overall_precision", results.get("precision", 0.0)),
+        "recall": results.get("overall_recall", results.get("recall", 0.0)),
+        "f1": results.get("overall_f1", results.get("f1", 0.0)),
+        "accuracy": results.get("overall_accuracy", results.get("accuracy", 0.0)),
     }
 
 # ------------------------------------------------------ Schritt 6: Training vorbereiten und durchführen
 print('\n---- Schritt 6: Training starten ----')
+# GPU-/Mixed-Precision-Optimierung: aktiviere fp16 automatisch bei CUDA
+try:
+    import torch
+    use_fp16 = bool(getattr(torch.cuda, "is_available", lambda: False)())
+except Exception:
+    use_fp16 = False
+print(f'> Hardware: {"GPU erkannt – aktiviere fp16 Mixed Precision" if use_fp16 else "keine GPU – Training auf CPU ohne Mixed Precision"}')
 training_args = TrainingArguments(
     output_dir="./bert-ner-conllpp",
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
     learning_rate=2e-5,
     per_device_train_batch_size=8,  # Passe ggf. an bei wenig RAM (z.B. 4)
     per_device_eval_batch_size=8,
+    fp16=use_fp16,
     num_train_epochs=3,
     weight_decay=0.01,
     logging_dir="./logs",
     logging_steps=100,
-    load_best_model_at_end=True,
-    metric_for_best_model="f1",
-    push_to_hub=False,
 )
 
 trainer = Trainer(
@@ -136,14 +237,30 @@ print('> Training abgeschlossen!')
 
 # ------------------------------------------------------ Schritt 7: Testen mit Transformers-Pipeline
 print('\n---- Schritt 7: Ergebnisse testen mit Pipeline ----')
-ner_pipeline = pipeline(
-    "ner",
-    model=model,
-    tokenizer=tokenizer,
-    aggregation_strategy="simple"
-)
+# Abwärtskompatible Initialisierung: neuere Versionen nutzen aggregation_strategy, ältere grouped_entities
+try:
+    ner_pipeline = pipeline(
+        "ner",
+        model=model,
+        tokenizer=tokenizer,
+        aggregation_strategy="simple"
+    )
+except TypeError:
+    try:
+        ner_pipeline = pipeline(
+            "ner",
+            model=model,
+            tokenizer=tokenizer,
+            grouped_entities=True
+        )
+    except TypeError:
+        ner_pipeline = pipeline(
+            "ner",
+            model=model,
+            tokenizer=tokenizer
+        )
 print('> NER-Pipeline zum Testen initialisiert.')
-test_text = "Angela Merkel lebt in Berlin."
+test_text = "Elon Musk is the CEO of SpaceX and Tesla."
 results = ner_pipeline(test_text)
 
 print(f'> Test-Satz: {test_text}')
@@ -152,4 +269,10 @@ if not results:
 else:
     print('Forecast Entities erkannt:')
     for entity in results:
-        print(f"  Text: {entity['word']}\n  Typ (Label): {entity['entity_group']}\n  Score: {entity['score']:.3f}")
+        word = entity.get('word', entity.get('text', ''))
+        label = entity.get('entity_group', entity.get('entity', ''))
+        score = entity.get('score', None)
+        if score is not None:
+            print(f"  Text: {word}\n  Typ (Label): {label}\n  Score: {score:.3f}")
+        else:
+            print(f"  Text: {word}\n  Typ (Label): {label}")
